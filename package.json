@@ -1,0 +1,23 @@
+{
+  "name": "zodex",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "zodex": "./bin/zodex"
+  },
+  "scripts": {
+    "zodex": "bun run index.ts",
+    "serve": "bun run index.ts serve",
+    "install": "bun run index.ts install",
+    "build": "bun build --compile --outfile dist/zodex index.ts",
+    "typecheck": "bunx tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
