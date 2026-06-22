@@ -1,5 +1,6 @@
 import { DEFAULT_MODEL } from "./constants";
 import { toolCallId } from "./ids";
+import { buildToolNameCodec, type ToolNameCodec } from "./tool-names";
 import type {
   ChatCompletionRequest,
   ChatMessage,
@@ -70,19 +71,28 @@ function appendMessage(messages: ChatMessage[], message: ChatMessage): void {
   messages.push(message);
 }
 
-function functionCallFromItem(item: Record<string, unknown>): ChatToolCall {
+function functionCallFromItem(
+  item: Record<string, unknown>,
+  toolNames: ToolNameCodec,
+): ChatToolCall {
   const id = stringOrJson(item.call_id ?? item.id ?? toolCallId());
+  const name = stringOrJson(item.name ?? "tool");
+  const namespace =
+    typeof item.namespace === "string" ? item.namespace : undefined;
   return {
     id,
     type: "function",
     function: {
-      name: stringOrJson(item.name ?? "tool"),
+      name: toolNames.encode({ namespace, name }),
       arguments: stringOrJson(item.arguments ?? "{}"),
     },
   };
 }
 
-function itemToMessages(item: Record<string, unknown>): ChatMessage[] {
+function itemToMessages(
+  item: Record<string, unknown>,
+  toolNames: ToolNameCodec,
+): ChatMessage[] {
   const type = String(item.type ?? "");
 
   if (type === "function_call") {
@@ -90,7 +100,7 @@ function itemToMessages(item: Record<string, unknown>): ChatMessage[] {
       {
         role: "assistant",
         content: null,
-        tool_calls: [functionCallFromItem(item)],
+        tool_calls: [functionCallFromItem(item, toolNames)],
       },
     ];
   }
@@ -123,13 +133,7 @@ function itemToMessages(item: Record<string, unknown>): ChatMessage[] {
   }
 
   if (type === "reasoning") {
-    const summary = Array.isArray(item.summary)
-      ? item.summary.map(contentToText).join("")
-      : contentToText(item.summary ?? item.content);
-    if (!summary) {
-      return [];
-    }
-    return [{ role: "assistant", content: `[reasoning]\n${summary}` }];
+    return [];
   }
 
   const role = String(item.role ?? "user");
@@ -144,7 +148,40 @@ function itemToMessages(item: Record<string, unknown>): ChatMessage[] {
   return [{ role: chatRole, content: contentToText(content) }];
 }
 
-function normalizeTools(tools: unknown[] | undefined): unknown[] | undefined {
+function descriptionWithNamespace(
+  description: unknown,
+  namespace: string,
+): string {
+  const text = stringOrJson(description);
+  return text ? `[namespace: ${namespace}] ${text}` : `[namespace: ${namespace}]`;
+}
+
+function normalizeFunctionTool(
+  tool: Record<string, unknown>,
+  name: string,
+  description = tool.description,
+): unknown {
+  const parameters: Record<string, unknown> = isRecord(tool.parameters)
+    ? { ...tool.parameters }
+    : { type: "object" };
+  if (!("type" in parameters)) {
+    parameters.type = "object";
+  }
+  return {
+    type: "function",
+    function: {
+      name,
+      description: stringOrJson(description),
+      parameters,
+      strict: Boolean(tool.strict ?? false),
+    },
+  };
+}
+
+function normalizeTools(
+  tools: unknown[] | undefined,
+  toolNames: ToolNameCodec,
+): unknown[] | undefined {
   if (!tools?.length) {
     return undefined;
   }
@@ -153,32 +190,42 @@ function normalizeTools(tools: unknown[] | undefined): unknown[] | undefined {
     if (!isRecord(tool)) {
       return [];
     }
+    if (tool.type === "namespace") {
+      const namespace = stringOrJson(tool.name ?? "");
+      const innerTools = Array.isArray(tool.tools) ? tool.tools : [];
+      return innerTools.flatMap((innerTool) => {
+        if (!isRecord(innerTool) || innerTool.type !== "function") {
+          return [];
+        }
+        const name = stringOrJson(innerTool.name ?? "");
+        if (!name) {
+          return [];
+        }
+        return [
+          normalizeFunctionTool(
+            innerTool,
+            toolNames.encode({ namespace, name }),
+            descriptionWithNamespace(innerTool.description, namespace),
+          ),
+        ];
+      });
+    }
     if (tool.type !== "function") {
       return [];
     }
     if (isRecord(tool.function)) {
       return [tool];
     }
-    const parameters: Record<string, unknown> = isRecord(tool.parameters)
-      ? { ...tool.parameters }
-      : { type: "object" };
-    if (!("type" in parameters)) {
-      parameters.type = "object";
-    }
-    return [{
-      type: "function",
-      function: {
-        name: stringOrJson(tool.name ?? ""),
-        description: stringOrJson(tool.description ?? ""),
-        parameters,
-        strict: Boolean(tool.strict ?? false),
-      },
-    }];
+    const name = stringOrJson(tool.name ?? "");
+    return [normalizeFunctionTool(tool, toolNames.encode({ name }))];
   });
   return normalized.length ? normalized : undefined;
 }
 
-export function normalizeToolChoice(toolChoice: unknown): unknown {
+export function normalizeToolChoice(
+  toolChoice: unknown,
+  toolNames = buildToolNameCodec(undefined),
+): unknown {
   if (toolChoice === undefined || toolChoice === null) {
     return undefined;
   }
@@ -189,7 +236,19 @@ export function normalizeToolChoice(toolChoice: unknown): unknown {
     return toolChoice;
   }
   if (isRecord(toolChoice.function) && toolChoice.function.name) {
-    return toolChoice;
+    return {
+      ...toolChoice,
+      function: {
+        ...toolChoice.function,
+        name: toolNames.encode({
+          name: stringOrJson(toolChoice.function.name),
+          namespace:
+            typeof toolChoice.function.namespace === "string"
+              ? toolChoice.function.namespace
+              : undefined,
+        }),
+      },
+    };
   }
   const type = String(toolChoice.type ?? "");
   if (type === "auto" || type === "none") {
@@ -201,7 +260,15 @@ export function normalizeToolChoice(toolChoice: unknown): unknown {
   if (type === "function" && toolChoice.name) {
     return {
       type: "function",
-      function: { name: stringOrJson(toolChoice.name) },
+      function: {
+        name: toolNames.encode({
+          name: stringOrJson(toolChoice.name),
+          namespace:
+            typeof toolChoice.namespace === "string"
+              ? toolChoice.namespace
+              : undefined,
+        }),
+      },
     };
   }
   return toolChoice;
@@ -255,6 +322,7 @@ export function translateResponsesRequest(
   defaultModel = DEFAULT_MODEL,
 ): ChatCompletionRequest {
   const model = String(request.model || defaultModel).toLowerCase();
+  const toolNames = buildToolNameCodec(request.tools);
   const systemParts: string[] = [];
   const messages: ChatMessage[] = [];
 
@@ -276,17 +344,17 @@ export function translateResponsesRequest(
         systemParts.push(contentToText(rawItem.content ?? rawItem.text));
         continue;
       }
-      for (const message of itemToMessages(rawItem)) {
+      for (const message of itemToMessages(rawItem, toolNames)) {
         appendMessage(messages, message);
       }
     }
   } else if (isRecord(input)) {
-    for (const message of itemToMessages(input)) {
+    for (const message of itemToMessages(input, toolNames)) {
       appendMessage(messages, message);
     }
   }
 
-  const tools = normalizeTools(request.tools);
+  const tools = normalizeTools(request.tools, toolNames);
   const fixedMessages = ensureToolOutputsHaveCalls(messages, tools);
 
   if (systemParts.length > 0) {
@@ -322,7 +390,7 @@ export function translateResponsesRequest(
   if (request.metadata !== undefined) {
     translated.metadata = request.metadata;
   }
-  const normalizedToolChoice = normalizeToolChoice(request.tool_choice);
+  const normalizedToolChoice = normalizeToolChoice(request.tool_choice, toolNames);
   if (normalizedToolChoice !== undefined) {
     translated.tool_choice = normalizedToolChoice;
   }

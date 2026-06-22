@@ -84,7 +84,7 @@ describe("translateResponsesRequest", () => {
     ]);
   });
 
-  test("drops Responses-only tool containers before chat completion", () => {
+  test("drops unsupported Responses-only tools before chat completion", () => {
     const translated = translateResponsesRequest({
       input: "hi",
       tools: [
@@ -102,11 +102,128 @@ describe("translateResponsesRequest", () => {
     expect((translated.tools?.[0] as any).function.name).toBe("shell");
   });
 
+  test("flattens namespace tools and encodes namespaced history with the same name", () => {
+    const translated = translateResponsesRequest({
+      input: [
+        {
+          type: "function_call",
+          call_id: "call_1",
+          namespace: "mcp.fs",
+          name: "read/file",
+          arguments: "{\"path\":\"README.md\"}",
+        },
+      ],
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp.fs",
+          tools: [
+            {
+              type: "function",
+              name: "read/file",
+              description: "Read a file",
+              parameters: { type: "object" },
+            },
+          ],
+        },
+      ],
+    });
+
+    const chatName = (translated.tools?.[0] as any).function.name;
+    expect(chatName).toBe("mcp_fs_read_file");
+    expect((translated.tools?.[0] as any).function.description).toContain(
+      "[namespace: mcp.fs]",
+    );
+    expect((translated.messages[0] as any).tool_calls[0].function.name).toBe(
+      chatName,
+    );
+  });
+
+  test("keeps flattened namespace tool names unique after sanitization", () => {
+    const translated = translateResponsesRequest({
+      input: "hi",
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp.fs",
+          tools: [{ type: "function", name: "read/file" }],
+        },
+        {
+          type: "namespace",
+          name: "mcp/fs",
+          tools: [{ type: "function", name: "read_file" }],
+        },
+      ],
+    });
+
+    expect((translated.tools?.[0] as any).function.name).toBe("mcp_fs_read_file");
+    expect((translated.tools?.[1] as any).function.name).toBe(
+      "mcp_fs_read_file_2",
+    );
+  });
+
+  test("drops reasoning input items from chat history", () => {
+    const translated = translateResponsesRequest({
+      input: [
+        {
+          type: "reasoning",
+          summary: [{ type: "summary_text", text: "private thought" }],
+        },
+        { role: "user", content: "hi" },
+      ],
+    });
+
+    expect(translated.messages).toEqual([{ role: "user", content: "hi" }]);
+  });
+
   test("normalizes Cursor style tool_choice", () => {
     expect(normalizeToolChoice({ type: "tool" })).toBe("required");
     expect(normalizeToolChoice({ type: "function", name: "shell" })).toEqual({
       type: "function",
       function: { name: "shell" },
+    });
+  });
+
+  test("resolves forced namespaced tool_choice by unique inner tool name", () => {
+    const translated = translateResponsesRequest({
+      input: "hi",
+      tool_choice: { type: "function", name: "read/file" },
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp.fs",
+          tools: [{ type: "function", name: "read/file" }],
+        },
+      ],
+    });
+
+    expect(translated.tool_choice).toEqual({
+      type: "function",
+      function: { name: "mcp_fs_read_file" },
+    });
+  });
+
+  test("leaves ambiguous forced namespaced tool_choice as sanitized name", () => {
+    const translated = translateResponsesRequest({
+      input: "hi",
+      tool_choice: { type: "function", name: "lookup" },
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp.a",
+          tools: [{ type: "function", name: "lookup" }],
+        },
+        {
+          type: "namespace",
+          name: "mcp.b",
+          tools: [{ type: "function", name: "lookup" }],
+        },
+      ],
+    });
+
+    expect(translated.tool_choice).toEqual({
+      type: "function",
+      function: { name: "lookup" },
     });
   });
 

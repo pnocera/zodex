@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { chatCompletionToResponse, ResponsesStreamTranslator } from "../src/responses";
+import {
+  chatCompletionToResponse,
+  errorResponse,
+  parseChatCompletionSse,
+  ResponsesStreamTranslator,
+} from "../src/responses";
 
 function decodeEvents(chunks: Uint8Array[]): any[] {
   const text = new TextDecoder().decode(
@@ -141,6 +146,133 @@ describe("ResponsesStreamTranslator", () => {
     const completed = events.find((event) => event.type === "response.completed");
     expect(completed.response.output[0].arguments).toBe("{\"x\":\"haha\"}");
   });
+
+  test("decodes flattened namespace tool names in streaming output", () => {
+    const translator = new ResponsesStreamTranslator({
+      model: "glm-5.2",
+      input: "tool",
+      stream: true,
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp.fs",
+          tools: [{ type: "function", name: "read/file" }],
+        },
+      ],
+    });
+
+    const events = decodeEvents([
+      ...translator.start(),
+      ...translator.applyChunk({
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  id: "call_1",
+                  index: 0,
+                  type: "function",
+                  function: {
+                    name: "mcp_fs_read_file",
+                    arguments: "{\"path\":\"README.md\"}",
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      }),
+      ...translator.finish(),
+    ]);
+
+    const completed = events.find((event) => event.type === "response.completed");
+    expect(completed.response.output[0]).toMatchObject({
+      type: "function_call",
+      id: "call_1",
+      namespace: "mcp.fs",
+      name: "read/file",
+      arguments: "{\"path\":\"README.md\"}",
+    });
+  });
+
+  test("migrates a synthetic streaming tool id when the real id arrives later", () => {
+    const translator = new ResponsesStreamTranslator({
+      model: "glm-5.2",
+      input: "tool",
+      stream: true,
+    });
+
+    const events = decodeEvents([
+      ...translator.start(),
+      ...translator.applyChunk({
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  type: "function",
+                  function: { name: "echo", arguments: "{" },
+                },
+              ],
+            },
+          },
+        ],
+      }),
+      ...translator.applyChunk({
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  id: "call_real",
+                  index: 0,
+                  type: "function",
+                  function: { arguments: "}" },
+                },
+              ],
+            },
+          },
+        ],
+      }),
+      ...translator.finish(),
+    ]);
+
+    const completed = events.find((event) => event.type === "response.completed");
+    expect(completed.response.output).toHaveLength(1);
+    expect(completed.response.output[0]).toMatchObject({
+      type: "function_call",
+      id: "call_real",
+      name: "echo",
+      arguments: "{}",
+    });
+  });
+
+  test("emits Codex-compatible reasoning summary items", () => {
+    const translator = new ResponsesStreamTranslator({
+      model: "glm-5.2",
+      input: "think",
+      stream: true,
+    });
+
+    const events = decodeEvents([
+      ...translator.start(),
+      ...translator.applyChunk({
+        choices: [{ delta: { reasoning_content: "because" } }],
+      }),
+      ...translator.finish(),
+    ]);
+
+    expect(events.map((event) => event.type)).toContain(
+      "response.reasoning_summary_text.delta",
+    );
+    const completed = events.find((event) => event.type === "response.completed");
+    expect(completed.response.output[0]).toMatchObject({
+      type: "reasoning",
+      encrypted_content: null,
+      summary: [{ type: "summary_text", text: "because" }],
+    });
+  });
 });
 
 describe("chatCompletionToResponse", () => {
@@ -181,5 +313,129 @@ describe("chatCompletionToResponse", () => {
       output_tokens_details: { reasoning_tokens: 2 },
       total_tokens: 13,
     });
+  });
+
+  test("decodes flattened namespace tool names in non-streaming output", () => {
+    const response = chatCompletionToResponse(
+      {
+        id: "chatcmpl_1",
+        model: "glm-5.2",
+        choices: [
+          {
+            message: {
+              tool_calls: [
+                {
+                  id: "call_1",
+                  type: "function",
+                  function: {
+                    name: "mcp_fs_read_file",
+                    arguments: "{\"path\":\"README.md\"}",
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+      {
+        model: "glm-5.2",
+        input: "tool",
+        tools: [
+          {
+            type: "namespace",
+            name: "mcp.fs",
+            tools: [{ type: "function", name: "read/file" }],
+          },
+        ],
+      },
+    );
+
+    expect((response.output as any[])[0]).toMatchObject({
+      type: "function_call",
+      namespace: "mcp.fs",
+      name: "read/file",
+    });
+  });
+
+  test("non-streaming reasoning item includes encrypted_content", () => {
+    const response = chatCompletionToResponse(
+      {
+        id: "chatcmpl_1",
+        model: "glm-5.2",
+        choices: [{ message: { reasoning_content: "because" } }],
+      },
+      { model: "glm-5.2", input: "think" },
+    );
+
+    expect((response.output as any[])[0]).toMatchObject({
+      type: "reasoning",
+      encrypted_content: null,
+      summary: [{ type: "summary_text", text: "because" }],
+    });
+  });
+});
+
+describe("errorResponse", () => {
+  test("emits Codex-compatible string error codes", () => {
+    const response = errorResponse({ input: "hi" }, 502, "bad gateway");
+    const invalid = errorResponse({ input: "hi" }, 400, "bad request");
+    const limited = errorResponse({ input: "hi" }, 429, "rate limited");
+    const overloaded = errorResponse({ input: "hi" }, 503, "overloaded");
+
+    expect((response.error as any).code).toBe("502");
+    expect((response.error as any).message).toBe("bad gateway");
+    expect((invalid.error as any).code).toBe("invalid_prompt");
+    expect((limited.error as any).code).toBe("rate_limit_exceeded");
+    expect((overloaded.error as any).code).toBe("server_is_overloaded");
+  });
+});
+
+describe("parseChatCompletionSse", () => {
+  test("cancels upstream reader when abort signal fires", async () => {
+    let upstreamCancelled = false;
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode('data: {"choices":[{"delta":{"content":"O"}}]}\n\n'),
+        );
+      },
+      cancel() {
+        upstreamCancelled = true;
+      },
+    });
+    const abort = new AbortController();
+    const iterator = parseChatCompletionSse(stream, { signal: abort.signal });
+
+    const first = await iterator.next();
+    expect(first.done).toBe(false);
+    expect(first.value?.choices[0]?.delta?.content).toBe("O");
+
+    abort.abort("client disconnected");
+    const second = await iterator.next();
+
+    expect(second.done).toBe(true);
+    expect(upstreamCancelled).toBe(true);
+  });
+
+  test("throws a useful error when upstream stream goes idle", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start() {
+        // Intentionally never enqueue or close.
+      },
+    });
+    const iterator = parseChatCompletionSse(stream, {
+      requestId: "req_test",
+      idleTimeoutMs: 5,
+    });
+
+    let message = "";
+    try {
+      await iterator.next();
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    expect(message).toContain("upstream SSE idle timeout after 5ms for req_test");
   });
 });

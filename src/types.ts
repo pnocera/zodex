@@ -1,3 +1,5 @@
+import type { DebugConfig } from "./debug";
+
 export interface ResponsesRequest {
   model?: string;
   input?: unknown;
@@ -101,4 +103,7 @@ export interface RuntimeConfig {
   upstreamBaseUrl: string;
   apiKey?: string;
   defaultModel: string;
+  debug: DebugConfig;
+  upstreamFetchTimeoutMs: number;
+  streamIdleTimeoutMs: number;
 }

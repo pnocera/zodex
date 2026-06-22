@@ -1,5 +1,7 @@
 import { DEFAULT_MODEL } from "./constants";
+import type { DebugLogger } from "./debug";
 import { messageId, reasoningId, responseId } from "./ids";
+import { buildToolNameCodec, type DecodedToolName } from "./tool-names";
 import type {
   ChatCompletionChunk,
   ChatCompletionResponse,
@@ -15,6 +17,33 @@ interface ResponseEnvelopeOptions {
   output?: unknown[];
   usage?: unknown;
   error?: unknown;
+}
+
+function reasoningItem(id: string, text: string, status?: string): Record<string, unknown> {
+  return {
+    id,
+    type: "reasoning",
+    ...(status ? { status } : {}),
+    encrypted_content: null,
+    summary: text ? [{ type: "summary_text", text }] : [],
+  };
+}
+
+function functionCallItem(
+  id: string,
+  decoded: DecodedToolName,
+  args: string,
+  status: "in_progress" | "completed",
+): Record<string, unknown> {
+  return {
+    type: "function_call",
+    id,
+    call_id: id,
+    ...(decoded.namespace ? { namespace: decoded.namespace } : {}),
+    name: decoded.name,
+    arguments: args,
+    status,
+  };
 }
 
 function normalizeUsage(usage: unknown): unknown {
@@ -91,11 +120,7 @@ export function chatCompletionToResponse(
 
   const reasoning = message?.reasoning_content ?? message?.reasoning;
   if (reasoning) {
-    output.push({
-      id: reasoningId(),
-      type: "reasoning",
-      summary: [{ type: "summary_text", text: String(reasoning) }],
-    });
+    output.push(reasoningItem(reasoningId(), String(reasoning)));
   }
 
   if (message?.content) {
@@ -114,15 +139,16 @@ export function chatCompletionToResponse(
     });
   }
 
+  const toolNames = buildToolNameCodec(request.tools);
   for (const call of message?.tool_calls ?? []) {
-    output.push({
-      type: "function_call",
-      id: call.id,
-      call_id: call.id,
-      name: call.function.name,
-      arguments: call.function.arguments,
-      status: "completed",
-    });
+    output.push(
+      functionCallItem(
+        call.id,
+        toolNames.decode(call.function.name),
+        call.function.arguments,
+        "completed",
+      ),
+    );
   }
 
   return responseObject({
@@ -145,10 +171,23 @@ export function errorResponse(
     status: "failed",
     error: {
       type: "upstream_error",
-      code: status,
+      code: errorCodeForStatus(status),
       message,
     },
   });
+}
+
+function errorCodeForStatus(status: number): string {
+  if (status === 429) {
+    return "rate_limit_exceeded";
+  }
+  if (status === 503 || status === 529) {
+    return "server_is_overloaded";
+  }
+  if (status >= 400 && status < 500) {
+    return "invalid_prompt";
+  }
+  return String(status);
 }
 
 function sse(event: Record<string, unknown>): string {
@@ -208,11 +247,21 @@ function repairJsonArguments(argumentsText: string): string {
 interface ToolState {
   id: string;
   name: string;
+  namespace?: string;
   arguments: string;
   outputIndex: number;
   nameDone: boolean;
   done: boolean;
 }
+
+interface StreamReader {
+  read(): Promise<StreamReadResult>;
+  cancel(reason?: unknown): Promise<unknown>;
+}
+
+type StreamReadResult =
+  | { done: false; value: Uint8Array }
+  | { done: true; value?: Uint8Array };
 
 export class ResponsesStreamTranslator {
   private sequence = 0;
@@ -221,6 +270,8 @@ export class ResponsesStreamTranslator {
   private readonly output: unknown[] = [];
   private readonly toolsById = new Map<string, ToolState>();
   private readonly toolIdByIndex = new Map<number, string>();
+  private readonly syntheticToolIds = new Set<string>();
+  private readonly toolNames;
   private nextOutputIndex = 0;
   private text = "";
   private textItemId = "";
@@ -234,7 +285,9 @@ export class ResponsesStreamTranslator {
   private usage: unknown = null;
   private failure: { status: number; message: string } | null = null;
 
-  constructor(private readonly request: ResponsesRequest) {}
+  constructor(private readonly request: ResponsesRequest) {
+    this.toolNames = buildToolNameCodec(request.tools);
+  }
 
   start(): Uint8Array[] {
     return [
@@ -294,17 +347,14 @@ export class ResponsesStreamTranslator {
     const events: Uint8Array[] = [];
     if (this.reasoningStarted && !this.reasoningDone) {
       events.push(
-        this.emit("response.reasoning_text.done", {
+        this.emit("response.reasoning_summary_text.done", {
           item_id: this.reasoningItemId,
           output_index: this.reasoningOutputIndex,
+          summary_index: 0,
           text: this.reasoning,
         }),
       );
-      const item = {
-        id: this.reasoningItemId,
-        type: "reasoning",
-        summary: [{ type: "summary_text", text: this.reasoning }],
-      };
+      const item = reasoningItem(this.reasoningItemId, this.reasoning);
       this.output[this.reasoningOutputIndex] = item;
       events.push(
         this.emit("response.output_item.done", {
@@ -362,14 +412,12 @@ export class ResponsesStreamTranslator {
           arguments: tool.arguments,
         }),
       );
-      const item = {
-        type: "function_call",
-        id: tool.id,
-        call_id: tool.id,
-        name: tool.name,
-        arguments: tool.arguments,
-        status: "completed",
-      };
+      const item = functionCallItem(
+        tool.id,
+        { namespace: tool.namespace, name: tool.name },
+        tool.arguments,
+        "completed",
+      );
       this.output[tool.outputIndex] = item;
       events.push(
         this.emit("response.output_item.done", {
@@ -460,16 +508,26 @@ export class ResponsesStreamTranslator {
             id: this.reasoningItemId,
             type: "reasoning",
             status: "in_progress",
+            encrypted_content: null,
             summary: [],
           },
+        }),
+      );
+      events.push(
+        this.emit("response.reasoning_summary_part.added", {
+          item_id: this.reasoningItemId,
+          output_index: this.reasoningOutputIndex,
+          summary_index: 0,
+          part: { type: "summary_text", text: "" },
         }),
       );
     }
     this.reasoning += delta;
     events.push(
-      this.emit("response.reasoning_text.delta", {
+      this.emit("response.reasoning_summary_text.delta", {
         item_id: this.reasoningItemId,
         output_index: this.reasoningOutputIndex,
+        summary_index: 0,
         delta,
       }),
     );
@@ -479,14 +537,35 @@ export class ResponsesStreamTranslator {
   private toolDelta(delta: ChatToolCallDelta): Uint8Array[] {
     const events: Uint8Array[] = [];
     const index = delta.index ?? 0;
-    const id = delta.id ?? this.toolIdByIndex.get(index) ?? `call_${index}`;
+    const incomingId = delta.id && delta.id.length > 0 ? delta.id : undefined;
+    const existingId = this.toolIdByIndex.get(index);
+    let id = existingId ?? incomingId ?? `call_${index}`;
+    if (!existingId && !incomingId) {
+      this.syntheticToolIds.add(id);
+    } else if (
+      existingId &&
+      incomingId &&
+      existingId !== incomingId &&
+      this.syntheticToolIds.has(existingId)
+    ) {
+      const existingTool = this.toolsById.get(existingId);
+      if (existingTool) {
+        this.toolsById.delete(existingId);
+        existingTool.id = incomingId;
+        this.toolsById.set(incomingId, existingTool);
+      }
+      this.syntheticToolIds.delete(existingId);
+      id = incomingId;
+    }
     this.toolIdByIndex.set(index, id);
 
     let tool = this.toolsById.get(id);
     if (!tool) {
+      const decoded = this.toolNames.decode(delta.function?.name ?? "");
       tool = {
         id,
-        name: delta.function?.name ?? "",
+        name: decoded.name,
+        namespace: decoded.namespace,
         arguments: "",
         outputIndex: this.nextOutputIndex++,
         nameDone: false,
@@ -500,6 +579,7 @@ export class ResponsesStreamTranslator {
             type: "function_call",
             id,
             call_id: id,
+            ...(tool.namespace ? { namespace: tool.namespace } : {}),
             name: tool.name,
             arguments: "",
             status: "in_progress",
@@ -509,7 +589,9 @@ export class ResponsesStreamTranslator {
     }
 
     if (delta.function?.name && !tool.nameDone) {
-      tool.name = delta.function.name;
+      const decoded = this.toolNames.decode(delta.function.name);
+      tool.name = decoded.name;
+      tool.namespace = decoded.namespace;
       tool.nameDone = true;
       events.push(
         this.emit("response.function_call_name.done", {
@@ -547,16 +629,48 @@ export class ResponsesStreamTranslator {
 
 export async function* parseChatCompletionSse(
   body: ReadableStream<Uint8Array>,
+  options: {
+    requestId?: string;
+    logger?: DebugLogger;
+    idleTimeoutMs?: number;
+    signal?: AbortSignal;
+  } = {},
 ): AsyncGenerator<ChatCompletionChunk> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let rawChunkCount = 0;
+  let eventCount = 0;
+  const idleTimeoutMs = options.idleTimeoutMs ?? 0;
+  const logger = options.logger;
+  const requestId = options.requestId;
+  const signal = options.signal;
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readWithOptionalTimeout(
+        reader as StreamReader,
+        idleTimeoutMs,
+        requestId,
+        signal,
+      );
       if (done) {
+        logger?.log("upstream.sse.eof", {
+          request_id: requestId,
+          raw_chunks: rawChunkCount,
+          events: eventCount,
+        });
         break;
       }
+      rawChunkCount += 1;
+      logger?.log(
+        "upstream.sse.raw_chunk",
+        {
+          request_id: requestId,
+          raw_chunks: rawChunkCount,
+          bytes: value.byteLength,
+        },
+        "trace",
+      );
       buffer += decoder.decode(value, { stream: true });
       let boundary = buffer.indexOf("\n\n");
       while (boundary !== -1) {
@@ -568,8 +682,16 @@ export async function* parseChatCompletionSse(
           }
           const data = line.slice(5).trimStart();
           if (!data || data === "[DONE]") {
+            if (data === "[DONE]") {
+              logger?.log("upstream.sse.done_marker", {
+                request_id: requestId,
+                raw_chunks: rawChunkCount,
+                events: eventCount,
+              });
+            }
             continue;
           }
+          eventCount += 1;
           yield JSON.parse(data) as ChatCompletionChunk;
         }
         boundary = buffer.indexOf("\n\n");
@@ -577,5 +699,59 @@ export async function* parseChatCompletionSse(
     }
   } finally {
     reader.releaseLock();
+  }
+}
+
+async function readWithOptionalTimeout(
+  reader: StreamReader,
+  idleTimeoutMs: number,
+  requestId?: string,
+  signal?: AbortSignal,
+): Promise<StreamReadResult> {
+  if (signal?.aborted) {
+    await reader.cancel(signal.reason ?? "zodex stream cancelled").catch(() => undefined);
+    return { done: true };
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let removeAbortListener: (() => void) | undefined;
+  const timeout = Symbol("timeout");
+  const aborted = Symbol("aborted");
+  try {
+    const contenders: Promise<StreamReadResult | typeof timeout | typeof aborted>[] = [
+      reader.read(),
+    ];
+    if (idleTimeoutMs > 0) {
+      contenders.push(new Promise<typeof timeout>((resolve) => {
+        timer = setTimeout(() => {
+          resolve(timeout);
+        }, idleTimeoutMs);
+      }));
+    }
+    if (signal) {
+      contenders.push(new Promise<typeof aborted>((resolve) => {
+        const onAbort = () => resolve(aborted);
+        signal.addEventListener("abort", onAbort, { once: true });
+        removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+      }));
+    }
+    const result = await Promise.race(contenders);
+    if (result === timeout) {
+      await reader.cancel("zodex upstream SSE idle timeout").catch(() => undefined);
+      throw new Error(
+        `upstream SSE idle timeout after ${idleTimeoutMs}ms${
+          requestId ? ` for ${requestId}` : ""
+        }`,
+      );
+    }
+    if (result === aborted) {
+      await reader.cancel(signal?.reason ?? "zodex stream cancelled").catch(() => undefined);
+      return { done: true };
+    }
+    return result;
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+    removeAbortListener?.();
   }
 }
