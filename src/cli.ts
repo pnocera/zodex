@@ -351,6 +351,7 @@ export async function main(args: string[]): Promise<void> {
 
   if (command === "install") {
     const result = await install({ zodexBin: preferredInstallBin() });
+    console.log(`Wrote ${result.modelCatalogPath}`);
     console.log(`Wrote ${result.profilePath}`);
     console.log(`Updated ${result.zshrcPath}`);
     for (const warning of result.warnings) {

@@ -26,6 +26,17 @@ function stringOrJson(value: unknown): string {
   }
 }
 
+export function zaiReasoningEffort(effort: string): string {
+  switch (effort.trim().toLowerCase()) {
+    case "xhigh":
+    case "max":
+    case "ultracode":
+      return "max";
+    default:
+      return "high";
+  }
+}
+
 function contentToText(content: unknown): string {
   if (typeof content === "string") {
     return content;
@@ -404,7 +415,7 @@ export function translateResponsesRequest(
   ) {
     const reasoning = request.reasoning as Record<string, unknown>;
     if (typeof reasoning.effort === "string") {
-      translated.reasoning_effort = reasoning.effort;
+      translated.reasoning_effort = zaiReasoningEffort(reasoning.effort);
     }
   }
   if (request.stream) {

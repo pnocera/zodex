@@ -177,7 +177,8 @@ bun run build
 ./dist/zodex install
 ```
 
-This writes `~/.codex/zai-glm52.config.toml` and updates a managed block in
+This writes `~/.codex/zai-glm52.config.toml`, writes a single-model
+`~/.codex/zai-glm52.models.json` catalog, and updates a managed block in
 `~/.zshrc`. It does not rewrite `~/.codex/config.toml` and never writes
 `ZAI_API_KEY`.
 
@@ -185,7 +186,9 @@ Generated profile:
 
 ```toml
 model = "glm-5.2"
+model_reasoning_effort = "max"
 model_provider = "zodex-zai"
+model_catalog_json = "/home/pierre/.codex/zai-glm52.models.json"
 
 [model_providers.zodex-zai]
 name = "Z.AI GLM 5.2 via zodex"
@@ -194,6 +197,13 @@ env_key = "ZAI_API_KEY"
 wire_api = "responses"
 stream_idle_timeout_ms = 3000000
 ```
+
+The generated model catalog advertises GLM-5.2 as a text-only, reasoning-capable
+model with 1M context, 128K maximum output, and `high`/`max` reasoning efforts.
+During install, zodex asks the installed Codex binary for its bundled catalog
+with `codex debug models --bundled` and reuses Codex's current base instructions
+for the GLM entry. If that command is unavailable, zodex falls back to a compact
+Codex-compatible base instruction so install remains offline-tolerant.
 
 Aliases:
 

@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { normalizeToolChoice, translateResponsesRequest } from "../src/translate";
+import {
+  normalizeToolChoice,
+  translateResponsesRequest,
+  zaiReasoningEffort,
+} from "../src/translate";
 
 describe("translateResponsesRequest", () => {
   test("merges instructions and developer messages into one system message", () => {
@@ -227,12 +231,17 @@ describe("translateResponsesRequest", () => {
     });
   });
 
-  test("maps reasoning effort to a string when summary is present", () => {
+  test("maps Codex reasoning effort to Z.AI high/max values", () => {
     const translated = translateResponsesRequest({
       input: "hi",
       reasoning: { effort: "medium", summary: "auto" },
     });
 
-    expect(translated.reasoning_effort).toBe("medium");
+    expect(translated.reasoning_effort).toBe("high");
+    expect(zaiReasoningEffort("xhigh")).toBe("max");
+    expect(zaiReasoningEffort("max")).toBe("max");
+    expect(zaiReasoningEffort("UltraCode")).toBe("max");
+    expect(zaiReasoningEffort("low")).toBe("high");
+    expect(zaiReasoningEffort("unknown")).toBe("high");
   });
 });
