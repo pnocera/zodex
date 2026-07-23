@@ -47,7 +47,7 @@ export function runtimeConfigFromEnv(env: Env = process.env): RuntimeConfig {
       env.ZAI_BASE_URL ||
       env.ZODEX_UPSTREAM_BASE_URL ||
       DEFAULT_UPSTREAM_BASE_URL,
-    apiKey: env.ZAI_API_KEY,
+    apiKey: env.SYNTHETIC_API_KEY || env.ZAI_API_KEY,
     defaultModel: env.ZODEX_MODEL || DEFAULT_MODEL,
     debug,
     upstreamFetchTimeoutMs: numberFromEnv(
