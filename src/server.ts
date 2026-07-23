@@ -159,7 +159,7 @@ async function handleResponses(
     request_id: id,
     method: request.method,
     path: url.pathname,
-    content_length: request.headers.get("content-length"),
+    content_length_header: request.headers.get("content-length"),
     body_bytes: encodedLength(rawBody),
     user_agent: request.headers.get("user-agent"),
   }));
@@ -186,7 +186,7 @@ async function handleResponses(
       tools: toolNames.dropped,
     });
   }
-  const translated = translateResponsesRequest(body, config.defaultModel);
+  const translated = translateResponsesRequest(body, config.defaultModel, debug);
   debug.log("request.translated", () => ({
     request_id: id,
     ...summarizeChatRequest(translated),
@@ -206,7 +206,7 @@ async function handleResponses(
       error: message,
     });
     if (body.stream) {
-      const translator = new ResponsesStreamTranslator(body);
+      const translator = new ResponsesStreamTranslator(body, debug);
       return new Response(
         new ReadableStream<Uint8Array>({
           start(controller) {
@@ -231,7 +231,7 @@ async function handleResponses(
       text,
     });
     if (body.stream) {
-      const translator = new ResponsesStreamTranslator(body);
+      const translator = new ResponsesStreamTranslator(body, debug);
       return new Response(
         new ReadableStream<Uint8Array>({
           start(controller) {
@@ -250,7 +250,7 @@ async function handleResponses(
   }
 
   if (body.stream) {
-    const translator = new ResponsesStreamTranslator(body);
+    const translator = new ResponsesStreamTranslator(body, debug);
     const streamAbort = new AbortController();
     let cancelled = false;
     return new Response(
@@ -383,7 +383,21 @@ async function handleResponses(
     );
   }
 
-  const upstreamJson = (await upstream.json()) as ChatCompletionResponse;
+  let upstreamJson: ChatCompletionResponse;
+  try {
+    upstreamJson = (await upstream.json()) as ChatCompletionResponse;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    debug.log("response.non_stream.parse_failed", {
+      request_id: id,
+      elapsed_ms: Date.now() - startedAt,
+      error: message,
+    });
+    return json(
+      errorResponse(body, 502, `upstream returned invalid JSON: ${message}`),
+      { status: 502 },
+    );
+  }
   debug.log("response.non_stream.finish", {
     request_id: id,
     elapsed_ms: Date.now() - startedAt,

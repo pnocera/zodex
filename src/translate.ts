@@ -1,4 +1,5 @@
 import { DEFAULT_MODEL } from "./constants";
+import type { DebugLogger } from "./debug";
 import { toolCallId } from "./ids";
 import { buildToolNameCodec, type ToolNameCodec } from "./tool-names";
 import type {
@@ -68,15 +69,20 @@ function contentToText(content: unknown): string {
 
 function appendMessage(messages: ChatMessage[], message: ChatMessage): void {
   const last = messages.at(-1);
+  // Chat Completions expects a single assistant turn to carry both its text and
+  // its tool_calls. Coalesce an incoming function_call (assistant message with
+  // tool_calls and no content) onto the preceding assistant message — whether
+  // that message is prior tool_calls (parallel calls) or an assistant text
+  // message — instead of emitting two adjacent assistant messages.
   if (
     last?.role === "assistant" &&
     message.role === "assistant" &&
-    last.tool_calls &&
     message.tool_calls &&
-    (!last.content || last.content === "") &&
     (!message.content || message.content === "")
   ) {
-    last.tool_calls.push(...message.tool_calls);
+    last.tool_calls = last.tool_calls
+      ? [...last.tool_calls, ...message.tool_calls]
+      : [...message.tool_calls];
     return;
   }
   messages.push(message);
@@ -298,20 +304,28 @@ function ensureToolOutputsHaveCalls(
   tools: unknown[] | undefined,
 ): ChatMessage[] {
   const result: ChatMessage[] = [];
+  // Track the most recent assistant message as we build `result` so each tool
+  // output can check its matching call in O(1) instead of rescanning the whole
+  // prefix (previously O(n²) over a long session's tool round-trips).
+  let lastAssistant: ChatMessage | undefined;
   for (const message of messages) {
     if (message.role !== "tool" || !message.tool_call_id) {
       result.push(message);
+      if (message.role === "assistant") {
+        lastAssistant = message;
+      }
       continue;
     }
 
-    const previousAssistant = [...result]
-      .reverse()
-      .find((entry) => entry.role === "assistant");
-    const hasCall = previousAssistant?.tool_calls?.some(
+    const hasCall = lastAssistant?.tool_calls?.some(
       (call) => call.id === message.tool_call_id,
     );
     if (!hasCall) {
-      result.push({
+      // Repair malformed Codex history (a tool output with no preceding call).
+      // firstToolName picks a *declared* function tool so the synthesized call's
+      // name still matches the request's tool set — upstreams that validate
+      // tool_call names against declared tools reject an invented name.
+      const synthetic: ChatMessage = {
         role: "assistant",
         content: null,
         tool_calls: [
@@ -321,7 +335,9 @@ function ensureToolOutputsHaveCalls(
             function: { name: firstToolName(tools), arguments: "{}" },
           },
         ],
-      });
+      };
+      result.push(synthetic);
+      lastAssistant = synthetic;
     }
     result.push(message);
   }
@@ -331,8 +347,20 @@ function ensureToolOutputsHaveCalls(
 export function translateResponsesRequest(
   request: ResponsesRequest,
   defaultModel = DEFAULT_MODEL,
+  logger?: DebugLogger,
 ): ChatCompletionRequest {
-  const model = String(request.model || defaultModel).toLowerCase();
+  const requestedModel = String(request.model || defaultModel);
+  // Model ids are lowercased before forwarding (Z.AI expects lowercase). Some
+  // OpenAI-compatible upstreams are case-sensitive, so log when this actually
+  // changes the id — a resulting 404 is then diagnosable from the debug log.
+  const model = requestedModel.toLowerCase();
+  if (logger && model !== requestedModel) {
+    logger.log(
+      "request.model.lowercased",
+      { requested: requestedModel, forwarded: model },
+      "trace",
+    );
+  }
   const toolNames = buildToolNameCodec(request.tools);
   const systemParts: string[] = [];
   const messages: ChatMessage[] = [];

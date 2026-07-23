@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -9,8 +9,10 @@ import {
   codexProfileToml,
   glm52ModelCatalogJson,
   install,
+  lockIsStale,
   modelCatalogPath,
   removeMarkedBlock,
+  rotateBackups,
   upsertMarkedBlock,
 } from "../src/install";
 import { retryDelayMs } from "../src/upstream";
@@ -128,6 +130,11 @@ describe("install helpers", () => {
     expect(second.match(/zodex aliases/g)?.length).toBe(2);
     expect(second).toContain("\nb\n");
     expect(second).not.toContain("\na\n");
+    // T7: content outside the managed block must survive an update.
+    expect(second).toContain("export PATH=/bin");
+    expect(second.indexOf("export PATH=/bin")).toBeLessThan(
+      second.indexOf("# >>> zodex aliases >>>"),
+    );
   });
 
   test("warns about aliases outside the managed block", () => {
@@ -153,5 +160,58 @@ describe("install helpers", () => {
     expect(retryDelayMs(null, 0)).toBe(500);
     expect(retryDelayMs("", 1)).toBe(1000);
     expect(retryDelayMs("2", 1)).toBe(2000);
+  });
+
+  // T6: a non-numeric Retry-After (HTTP-date form) is not parseable as seconds,
+  // so it must fall back to exponential backoff rather than yield NaN.
+  test("429 retry delay falls back for HTTP-date Retry-After", () => {
+    expect(retryDelayMs("Wed, 21 Oct 2025 07:28:00 GMT", 0)).toBe(500);
+    expect(retryDelayMs("Wed, 21 Oct 2025 07:28:00 GMT", 2)).toBe(2000);
+  });
+
+  // N10: keep only the newest `keep` timestamped backups; never touch the stable
+  // suffix-less base backup.
+  test("rotateBackups prunes old timestamped backups but keeps the base", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "zodex-backups-"));
+    try {
+      const base = join(dir, ".zshrc.zodex.bak");
+      await writeFile(base, "stable", "utf8"); // suffix-less, must survive
+      for (const ts of [100, 200, 300, 400]) {
+        await writeFile(`${base}.${ts}`, String(ts), "utf8");
+      }
+      await rotateBackups(base, 2);
+
+      const remaining = (await readdir(dir)).sort();
+      expect(remaining).toEqual([
+        ".zshrc.zodex.bak",
+        ".zshrc.zodex.bak.300",
+        ".zshrc.zodex.bak.400",
+      ]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // R3-N1: a lockfile owned by a dead pid is reclaimable; a live/ambiguous owner
+  // is not. Guards against the reclaim path silently reverting to always-wait.
+  test("lockIsStale reclaims a dead owner but not a live/ambiguous one", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "zodex-lock-"));
+    try {
+      const lock = join(dir, ".zshrc.zodex.lock");
+
+      await writeFile(lock, String(process.pid), "utf8"); // self = alive
+      expect(await lockIsStale(lock)).toBe(false);
+
+      await writeFile(lock, "2147483646", "utf8"); // a pid that cannot exist
+      expect(await lockIsStale(lock)).toBe(true);
+
+      await writeFile(lock, "", "utf8"); // just created, pid not written yet
+      expect(await lockIsStale(lock)).toBe(false);
+
+      await writeFile(lock, "not-a-pid", "utf8"); // unknown owner
+      expect(await lockIsStale(lock)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

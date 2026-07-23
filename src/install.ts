@@ -1,7 +1,16 @@
 import { spawn } from "node:child_process";
-import { copyFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import {
+  copyFile,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  rename,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   ALIAS_BLOCK_END,
   ALIAS_BLOCK_START,
@@ -76,6 +85,113 @@ async function writeAtomic(path: string, content: string): Promise<void> {
   const tmpPath = `${path}.zodex.${process.pid}.tmp`;
   await writeFile(tmpPath, content, "utf8");
   await rename(tmpPath, path);
+}
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+// Is the lockfile owned by a process that no longer exists? Only returns true
+// when we can POSITIVELY confirm the owning pid is dead, so we never reclaim a
+// lock that another run just created (empty/unknown owner → treated as live).
+export async function lockIsStale(lockPath: string): Promise<boolean> {
+  let content: string;
+  try {
+    content = (await readFile(lockPath, "utf8")).trim();
+  } catch {
+    return false; // vanished/unreadable — let the retry loop handle it
+  }
+  if (!content) {
+    return false; // just created; pid not written yet
+  }
+  const pid = Number(content);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false; // unknown owner — don't reclaim
+  }
+  try {
+    process.kill(pid, 0); // signal 0 = existence check
+    return false; // owner alive (or EPERM below means alive under another user)
+  } catch (error) {
+    return (
+      error !== null &&
+      typeof error === "object" &&
+      "code" in error &&
+      error.code === "ESRCH" // no such process → stale
+    );
+  }
+}
+
+// Serialize the read-modify-write of a shared file (~/.zshrc) across concurrent
+// `zodex install`/`uninstall` runs with an advisory O_EXCL lockfile, so two runs
+// can't both read the same base content and have the second rename clobber the
+// first. The lockfile records the owning pid so a lock left behind by a crashed
+// run (SIGKILL bypasses the finally cleanup) is reclaimed immediately instead of
+// forcing every later run to wait out the timeout. If the lock is held by a live
+// run and can't be taken within ~5s we warn and proceed rather than deadlock.
+async function withFileLock<T>(
+  targetPath: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const lockPath = `${targetPath}.zodex.lock`;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try {
+      handle = await open(lockPath, "wx");
+      await handle.writeFile(String(process.pid), "utf8");
+      break;
+    } catch (error) {
+      if (
+        error &&
+        typeof error === "object" &&
+        "code" in error &&
+        error.code === "EEXIST"
+      ) {
+        if (await lockIsStale(lockPath)) {
+          await unlink(lockPath).catch(() => undefined);
+          continue; // reclaim immediately, no sleep
+        }
+        await sleep(100);
+        continue;
+      }
+      throw error;
+    }
+  }
+  if (!handle) {
+    console.error(
+      `zodex: could not acquire ${lockPath} after 5s; proceeding without lock`,
+    );
+    return fn();
+  }
+  try {
+    return await fn();
+  } finally {
+    await handle.close().catch(() => undefined);
+    await unlink(lockPath).catch(() => undefined);
+  }
+}
+
+// Keep only the `keep` most recent timestamped `.zodex.bak.<ts>` backups of a
+// file so frequent installs don't accumulate them without bound. The stable
+// first-ever backup (`<base>` with no numeric suffix) is never touched.
+export async function rotateBackups(
+  basePath: string,
+  keep: number,
+): Promise<void> {
+  const dir = dirname(basePath);
+  const prefix = `${basename(basePath)}.`;
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return;
+  }
+  const backups = entries
+    .filter((name) => name.startsWith(prefix) && /\.\d+$/.test(name))
+    .map((name) => ({ name, ts: Number(name.slice(prefix.length)) }))
+    .filter((entry) => Number.isFinite(entry.ts))
+    .sort((a, b) => b.ts - a.ts); // newest first
+  for (const stale of backups.slice(keep)) {
+    await unlink(join(dir, stale.name)).catch(() => undefined);
+  }
 }
 
 function aliasBlock(zodexBin: string): string {
@@ -335,13 +451,26 @@ export async function install(options: InstallOptions = {}): Promise<{
     codexProfileToml({ ...options, home, modelCatalogPath: catalogPath }),
   );
 
-  const currentZshrc = await readText(zshrcPath);
-  if (currentZshrc && !(await exists(backupPath))) {
-    await copyFile(zshrcPath, backupPath);
-  }
-  const warnings = aliasConflictWarnings(currentZshrc);
-  const updatedZshrc = upsertMarkedBlock(currentZshrc, aliasBlock(zodexBin));
-  await writeAtomic(zshrcPath, updatedZshrc);
+  const warnings = await withFileLock(zshrcPath, async () => {
+    const currentZshrc = await readText(zshrcPath);
+    const conflicts = aliasConflictWarnings(currentZshrc);
+    const updatedZshrc = upsertMarkedBlock(currentZshrc, aliasBlock(zodexBin));
+    if (updatedZshrc === currentZshrc) {
+      return conflicts; // idempotent no-op: nothing to back up or write
+    }
+    if (currentZshrc) {
+      // Keep the first-ever pre-zodex snapshot stable for discovery/uninstall…
+      if (!(await exists(backupPath))) {
+        await copyFile(zshrcPath, backupPath);
+      }
+      // …and always add a fresh timestamped backup so a later install never
+      // silently loses edits the user made since the last run.
+      await copyFile(zshrcPath, `${backupPath}.${Date.now()}`);
+      await rotateBackups(backupPath, 5);
+    }
+    await writeAtomic(zshrcPath, updatedZshrc);
+    return conflicts;
+  });
 
   return { modelCatalogPath: catalogPath, profilePath, zshrcPath, warnings };
 }
@@ -354,7 +483,16 @@ export async function uninstall(options: InstallOptions = {}): Promise<{
   const codexDir = join(home, ".codex");
   const profilePath = join(codexDir, `${DEFAULT_PROFILE_NAME}.config.toml`);
   const zshrcPath = join(home, ".zshrc");
-  const currentZshrc = await readText(zshrcPath);
-  await writeAtomic(zshrcPath, removeMarkedBlock(currentZshrc));
+  const backupPath = `${zshrcPath}.zodex.bak`;
+  await withFileLock(zshrcPath, async () => {
+    const currentZshrc = await readText(zshrcPath);
+    const updated = removeMarkedBlock(currentZshrc);
+    if (updated === currentZshrc) {
+      return; // no managed block present: leave the file untouched
+    }
+    await copyFile(zshrcPath, `${backupPath}.${Date.now()}`);
+    await rotateBackups(backupPath, 5);
+    await writeAtomic(zshrcPath, updated);
+  });
   return { profilePath, zshrcPath };
 }

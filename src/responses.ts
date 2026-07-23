@@ -1,6 +1,6 @@
 import { DEFAULT_MODEL } from "./constants";
 import type { DebugLogger } from "./debug";
-import { messageId, reasoningId, responseId } from "./ids";
+import { messageId, reasoningId, responseId, toolCallId } from "./ids";
 import { buildToolNameCodec, type DecodedToolName } from "./tool-names";
 import type {
   ChatCompletionChunk,
@@ -33,7 +33,7 @@ function functionCallItem(
   id: string,
   decoded: DecodedToolName,
   args: string,
-  status: "in_progress" | "completed",
+  status: "in_progress" | "completed" | "incomplete",
 ): Record<string, unknown> {
   return {
     type: "function_call",
@@ -141,9 +141,13 @@ export function chatCompletionToResponse(
 
   const toolNames = buildToolNameCodec(request.tools);
   for (const call of message?.tool_calls ?? []) {
+    // Some OpenAI-compatible upstreams omit the tool-call id for a single call.
+    // Synthesize one (as the streaming path does) so Codex can correlate the
+    // later function_call_output; otherwise call_id would be undefined.
+    const id = call.id || toolCallId();
     output.push(
       functionCallItem(
-        call.id,
+        id,
         toolNames.decode(call.function.name),
         call.function.arguments,
         "completed",
@@ -277,6 +281,7 @@ export class ResponsesStreamTranslator {
   private textItemId = "";
   private textOutputIndex = -1;
   private textStarted = false;
+  private textDone = false;
   private reasoning = "";
   private reasoningItemId = "";
   private reasoningOutputIndex = -1;
@@ -284,8 +289,12 @@ export class ResponsesStreamTranslator {
   private reasoningDone = false;
   private usage: unknown = null;
   private failure: { status: number; message: string } | null = null;
+  private finished = false;
 
-  constructor(private readonly request: ResponsesRequest) {
+  constructor(
+    private readonly request: ResponsesRequest,
+    private readonly logger?: DebugLogger,
+  ) {
     this.toolNames = buildToolNameCodec(request.tools);
   }
 
@@ -341,10 +350,59 @@ export class ResponsesStreamTranslator {
   }
 
   finish(): Uint8Array[] {
+    // Exactly one terminal event per stream: a second finish()/fail() is a no-op
+    // so callers can never emit a duplicate response.completed/response.failed.
+    if (this.finished) {
+      return [];
+    }
     if (this.failure) {
       return this.fail(this.failure.status, this.failure.message);
     }
+    this.finished = true;
+    const events = this.closeOpenItems(false);
+    events.push(
+      this.emit("response.completed", {
+        response: responseObject({
+          request: this.request,
+          id: this.id,
+          status: "completed",
+          // filter(Boolean) is defensive: in the success path every started item
+          // is assigned by index in closeOpenItems, so there are no holes.
+          output: this.output.filter(Boolean),
+          usage: this.usage,
+        }),
+      }),
+    );
+    events.push(this.encoder.encode("data: [DONE]\n\n"));
+    return events;
+  }
+
+  fail(status: number, message: string): Uint8Array[] {
+    if (this.finished) {
+      return [];
+    }
+    this.finished = true;
+    // Close any output items that were opened before the failure so the event
+    // stream stays balanced (every output_item.added / *_part.added gets a
+    // matching *.done) before the terminal response.failed.
+    const events = this.closeOpenItems(true);
+    events.push(
+      this.emit("response.failed", {
+        response: errorResponse(this.request, status, message),
+      }),
+    );
+    events.push(this.encoder.encode("data: [DONE]\n\n"));
+    return events;
+  }
+
+  // Emit the closing `.done` events for every in-progress reasoning/text/tool
+  // item. Shared by finish() (normal completion) and fail() (mid-stream error),
+  // so a failed stream never leaves a dangling added-without-done item. When
+  // `failed` is true the items are closed with an "incomplete" status.
+  private closeOpenItems(failed: boolean): Uint8Array[] {
     const events: Uint8Array[] = [];
+    const itemStatus = failed ? "incomplete" : "completed";
+
     if (this.reasoningStarted && !this.reasoningDone) {
       events.push(
         this.emit("response.reasoning_summary_text.done", {
@@ -354,7 +412,23 @@ export class ResponsesStreamTranslator {
           text: this.reasoning,
         }),
       );
-      const item = reasoningItem(this.reasoningItemId, this.reasoning);
+      // Close the reasoning_summary_part opened in reasoningDelta so every
+      // *_part.added has a matching *_part.done (mirrors the text path's
+      // content_part.done, and matches the OpenAI event ordering: text.done
+      // then part.done then output_item.done).
+      events.push(
+        this.emit("response.reasoning_summary_part.done", {
+          item_id: this.reasoningItemId,
+          output_index: this.reasoningOutputIndex,
+          summary_index: 0,
+          part: { type: "summary_text", text: this.reasoning },
+        }),
+      );
+      const item = reasoningItem(
+        this.reasoningItemId,
+        this.reasoning,
+        failed ? "incomplete" : undefined,
+      );
       this.output[this.reasoningOutputIndex] = item;
       events.push(
         this.emit("response.output_item.done", {
@@ -365,7 +439,7 @@ export class ResponsesStreamTranslator {
       this.reasoningDone = true;
     }
 
-    if (this.textStarted) {
+    if (this.textStarted && !this.textDone) {
       events.push(
         this.emit("response.output_text.done", {
           item_id: this.textItemId,
@@ -377,7 +451,7 @@ export class ResponsesStreamTranslator {
       const item = {
         id: this.textItemId,
         type: "message",
-        status: "completed",
+        status: itemStatus,
         role: "assistant",
         content: [
           { type: "output_text", text: this.text, annotations: [] },
@@ -398,13 +472,26 @@ export class ResponsesStreamTranslator {
         }),
       );
       this.output[this.textOutputIndex] = item;
+      this.textDone = true;
     }
 
     for (const tool of this.toolsById.values()) {
       if (tool.done) {
         continue;
       }
-      tool.arguments = repairJsonArguments(tool.arguments);
+      const repaired = repairJsonArguments(tool.arguments);
+      if (repaired !== tool.arguments) {
+        this.logger?.log(
+          "tool.arguments.repaired",
+          {
+            item_id: tool.id,
+            original_length: tool.arguments.length,
+            repaired_length: repaired.length,
+          },
+          "trace",
+        );
+      }
+      tool.arguments = repaired;
       events.push(
         this.emit("response.function_call_arguments.done", {
           item_id: tool.id,
@@ -416,7 +503,7 @@ export class ResponsesStreamTranslator {
         tool.id,
         { namespace: tool.namespace, name: tool.name },
         tool.arguments,
-        "completed",
+        failed ? "incomplete" : "completed",
       );
       this.output[tool.outputIndex] = item;
       events.push(
@@ -428,28 +515,7 @@ export class ResponsesStreamTranslator {
       tool.done = true;
     }
 
-    events.push(
-      this.emit("response.completed", {
-        response: responseObject({
-          request: this.request,
-          id: this.id,
-          status: "completed",
-          output: this.output.filter(Boolean),
-          usage: this.usage,
-        }),
-      }),
-    );
-    events.push(this.encoder.encode("data: [DONE]\n\n"));
     return events;
-  }
-
-  fail(status: number, message: string): Uint8Array[] {
-    return [
-      this.emit("response.failed", {
-        response: errorResponse(this.request, status, message),
-      }),
-      this.encoder.encode("data: [DONE]\n\n"),
-    ];
   }
 
   private textDelta(delta: string): Uint8Array[] {
@@ -671,7 +737,11 @@ export async function* parseChatCompletionSse(
         },
         "trace",
       );
+      // Normalize CRLF to LF so events framed with `\r\n\r\n` (allowed by the SSE
+      // spec, emitted by some proxies / non-Z.AI OpenAI-compatible servers) split
+      // correctly — `indexOf("\n\n")` alone never matches a `\r\n\r\n` boundary.
       buffer += decoder.decode(value, { stream: true });
+      buffer = buffer.replace(/\r\n/g, "\n");
       let boundary = buffer.indexOf("\n\n");
       while (boundary !== -1) {
         const rawEvent = buffer.slice(0, boundary);
